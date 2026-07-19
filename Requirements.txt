@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pdfplumber
+pandas
+python-multipart
+mega.py
+tenacity
