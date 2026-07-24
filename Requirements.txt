@@ -4,4 +4,5 @@ pdfplumber
 pandas
 python-multipart
 mega.py
-tenacity
+tenacity>=8.2.0
+pycryptodome
