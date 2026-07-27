@@ -1,9 +1,9 @@
-
 import io
 import os
 import re
 import pdfplumber
 import pandas as pd
+from typing import List
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,29 +11,30 @@ from mega import Mega
 
 app = FastAPI()
 
-# Configures CORS so your Netlify static frontend can securely communicate with it
+# Configures CORS so your frontend can securely communicate with it
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, swap with your exact Netlify domain URL
+    allow_origins=["*"], # Allows requests from Netlify, ngrok, and local environments
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"], # Allows browser to read file download name
 )
 
 # Optional Mega.io Storage Integration
 MEGA_EMAIL = os.environ.get("MEGA_EMAIL", "rishikesh.weamg@gmail.com")
 MEGA_PASSWORD = os.environ.get("MEGA_PASSWORD", "WEAMG@CLOUD")
 
+m = None
 try:
     mega = Mega()
     m = mega.login(MEGA_EMAIL, MEGA_PASSWORD)
     print("Connected to Mega.io cloud storage safely.")
 except Exception as e:
-    m = None
     print(f"Mega.io configuration skipped or failed: {e}")
 
 # =========================================================
-# YOUR ORIGINAL EXTRACTION RULES (Unchanged)
+# EXTRACTION RULES
 # =========================================================
 def clean_number(value):
     if value is None: return None
@@ -100,52 +101,93 @@ def parse_bill(text, filename):
 
     return data
 
+# Helper function to extract text from PDF bytes
+def process_pdf_bytes(pdf_bytes, filename):
+    # Cloud Mega Backup Sequence
+    if m:
+        try:
+            temp_path = f"cloud_temp_{filename}"
+            with open(temp_path, "wb") as f:
+                f.write(pdf_bytes)
+            target_folder = m.find('Good Foods Bills')
+            m.upload(temp_path, target_folder[0] if target_folder else None)
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception as mega_err:
+            print(f"Mega backup error (non-fatal): {mega_err}")
+
+    # Extract textual components using pdfplumber
+    full_text = ""
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                full_text += page_text + "\n"
+
+    return parse_bill(full_text, filename)
+
 # =========================================================
-# WEB NETWORK ROUTE (Replacing Local Loop Processors)
+# WEB NETWORK ROUTES
 # =========================================================
+
+# BATCH MULTI-FILE ROUTE (Combines multiple bills into ONE CSV)
+@app.post("/api/process-bills-batch")
+@app.post("/extract_bills_batch/")
+async def process_bills_batch(files: List[UploadFile] = File(...)):
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded.")
+
+    combined_results = []
+
+    try:
+        for file in files:
+            if not file.filename.lower().endswith('.pdf'):
+                continue # Skip non-PDF files safely
+
+            pdf_bytes = await file.read()
+            parsed_data = process_pdf_bytes(pdf_bytes, file.filename)
+            combined_results.append(parsed_data)
+
+        if not combined_results:
+            raise HTTPException(status_code=400, detail="No valid PDF invoices were found in the uploaded batch.")
+
+        # Create a single combined DataFrame from all parsed results
+        df = pd.DataFrame(combined_results)
+        csv_buffer = io.StringIO()
+        df.to_csv(csv_buffer, index=False)
+
+        # Stream single consolidated CSV back to client
+        response = StreamingResponse(
+            iter([csv_buffer.getvalue()]), 
+            media_type="text/csv"
+        )
+        response.headers["Content-Disposition"] = "attachment; filename=consolidated_bills_report.csv"
+        return response
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# SINGLE FILE ROUTE (Preserved for backwards compatibility)
 @app.post("/api/process-bill")
+@app.post("/extract_bill/")
 async def process_bill(file: UploadFile = File(...)):
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Please upload a valid PDF invoice.")
 
     try:
-        # Read file bytes immediately into memory buffer
         pdf_bytes = await file.read()
-
-        # Cloud Mega Backup Sequence
-        if m:
-            try:
-                temp_path = f"cloud_temp_{file.filename}"
-                with open(temp_path, "wb") as f:
-                    f.write(pdf_bytes)
-                target_folder = m.find('Good Foods Bills')
-                m.upload(temp_path, target_folder[0] if target_folder else None)
-                os.remove(temp_path)
-            except Exception as mega_err:
-                print(f"Mega backup error: {mega_err}")
-
-        # Extract textual components using your logic
-        full_text = ""
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    full_text += page_text + "\n"
-
-        # Apply parsing operations
-        parsed_results = parse_bill(full_text, file.filename)
+        parsed_results = process_pdf_bytes(pdf_bytes, file.filename)
         
-        # Structure payload dynamically into a CSV string
         df = pd.DataFrame([parsed_results])
         csv_buffer = io.StringIO()
         df.to_csv(csv_buffer, index=False)
 
-        # Streams file directly down to the browser context
+        clean_filename = file.filename.replace('.pdf', '')
         response = StreamingResponse(
             iter([csv_buffer.getvalue()]), 
             media_type="text/csv"
         )
-        response.headers["Content-Disposition"] = f"attachment; filename=extracted_{file.filename.replace('.pdf', '')}.csv"
+        response.headers["Content-Disposition"] = f"attachment; filename=extracted_{clean_filename}.csv"
         return response
 
     except Exception as e:
