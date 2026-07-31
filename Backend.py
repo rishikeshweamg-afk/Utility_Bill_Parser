@@ -1,10 +1,14 @@
 import io
 import os
 import re
+import fitz  # PyMuPDF
+import asyncio
 import pdfplumber
+import pytesseract
 import pandas as pd
+from PIL import Image
 from typing import List
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from mega import Mega
@@ -14,12 +18,17 @@ app = FastAPI()
 # Configures CORS so your frontend can securely communicate with it
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Allows requests from Netlify, ngrok, and local environments
+    allow_origins=["*"],  # Allows requests from Netlify, ngrok, and local environments
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition"], # Allows browser to read file download name
+    expose_headers=["Content-Disposition"],  # Allows browser to read file download name
 )
+
+# Configure Tesseract path (Update if hosted on a server or different path)
+TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+if os.path.exists(TESSERACT_PATH):
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
 # Optional Mega.io Storage Integration
 MEGA_EMAIL = os.environ.get("MEGA_EMAIL", "rishikesh.weamg@gmail.com")
@@ -33,17 +42,20 @@ try:
 except Exception as e:
     print(f"Mega.io configuration skipped or failed: {e}")
 
+
 # =========================================================
-# EXTRACTION RULES
+# WE ENERGIES EXTRACTION RULES & HELPERS
 # =========================================================
 def clean_number(value):
-    if value is None: return None
+    if value is None:
+        return None
     return float(value.replace(",", "").strip())
 
 def extract_money_after_label(label, text):
     pattern = rf"{re.escape(label)}.*"
     match = re.search(pattern, text, re.IGNORECASE)
-    if not match: return None
+    if not match:
+        return None
     line = match.group(0)
     dollar_amounts = re.findall(r"\$([\d,]+\.\d{2})", line)
     if dollar_amounts:
@@ -53,15 +65,17 @@ def extract_money_after_label(label, text):
 def extract_taxable_percentage(label, text):
     pattern = rf"{re.escape(label)}.*?\(([\d\.]+)%\s*Taxable\)"
     match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-    if match: return float(match.group(1))
+    if match:
+        return float(match.group(1))
     return None
 
 def extract_value(pattern, text):
     match = re.search(pattern, text, re.DOTALL)
-    if match: return match.group(1).strip()
+    if match:
+        return match.group(1).strip()
     return None
 
-def parse_bill(text, filename):
+def parse_we_energies_bill(text, filename):
     data = {}
     data["FileName"] = filename
     data["BillDate"] = extract_value(r"Bill Date\s+Account Number.*?\n(\d{2}/\d{2}/\d{4})", text)
@@ -101,8 +115,142 @@ def parse_bill(text, filename):
 
     return data
 
-# Helper function to extract text from PDF bytes
-def process_pdf_bytes(pdf_bytes, filename):
+
+# =========================================================
+# ALLIANT ENERGY EXTRACTION RULES & OCR LOGIC
+# =========================================================
+def clean_money_alliant(value):
+    if value is None:
+        return ""
+    return value.replace("$", "").replace(",", "").replace("CR", "").strip()
+
+def get_last_dollar_alliant(line):
+    amounts = re.findall(r'\$([\d,]+\.\d{2})', line)
+    if amounts:
+        return amounts[-1].replace(",", "")
+    return ""
+
+def extract_multiple_alliant(text, keyword):
+    values = []
+    for line in text.splitlines():
+        if keyword.lower() in line.lower():
+            value = get_last_dollar_alliant(line)
+            if value:
+                values.append(value)
+    return values
+
+def extract_alliant_summary_fields(text):
+    data = {}
+
+    match = re.search(r'Account Number\s+(\d+)', text, re.IGNORECASE)
+    data["Account_Number"] = match.group(1) if match else ""
+
+    match = re.search(r'Account Name:\s*(.+)', text, re.IGNORECASE)
+    data["Account_Name"] = match.group(1).strip() if match else ""
+
+    match = re.search(r'Bill Date\s+([A-Za-z]{3}\s+\d{1,2},\s+\d{4})', text, re.IGNORECASE)
+    data["Bill_Date"] = match.group(1) if match else ""
+
+    amount_patterns = [
+        r'Amount Due\s*\$([\d,]+\.\d{2})',
+        r'Total Amount Due\s*\$([\d,]+\.\d{2})',
+        r'Balance Due\s*\$([\d,]+\.\d{2})'
+    ]
+    data["Amount_Due"] = ""
+    for pattern in amount_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            data["Amount_Due"] = clean_money_alliant(match.group(1))
+            break
+
+    match = re.search(r'Total Current Charges\s*\$([\d,]+\.\d{2})', text, re.IGNORECASE)
+    data["Total_Current_Charges"] = clean_money_alliant(match.group(1)) if match else ""
+
+    all_kwh = re.findall(r'(\d[\d,]*)\s*kWh', text, re.IGNORECASE)
+    if all_kwh:
+        data["Total_Electric_Use_KWH"] = max([int(x.replace(",", "")) for x in all_kwh])
+    else:
+        data["Total_Electric_Use_KWH"] = ""
+
+    match = re.search(r'High Rate.*?(\d[\d,]*)\s*kWh', text, re.IGNORECASE | re.DOTALL)
+    data["High_Rate_KWH"] = match.group(1).replace(",", "") if match else ""
+
+    match = re.search(r'Low Rate.*?(\d[\d,]*)\s*kWh', text, re.IGNORECASE | re.DOTALL)
+    data["Low_Rate_KWH"] = match.group(1).replace(",", "") if match else ""
+
+    match = re.search(r'Regular Rate.*?(\d[\d,]*)\s*kWh', text, re.IGNORECASE | re.DOTALL)
+    data["Regular_Rate_KWH"] = match.group(1).replace(",", "") if match else ""
+
+    match = re.search(r'On[- ]Peak Demand.*?([\d\.]+)', text, re.IGNORECASE)
+    data["On_Peak_Demand_KW"] = match.group(1) if match else ""
+
+    match = re.search(r'Off[- ]Peak Demand.*?([\d\.]+)', text, re.IGNORECASE)
+    data["Off_Peak_Demand_KW"] = match.group(1) if match else ""
+
+    return data
+
+def extract_alliant_charge_fields(text):
+    data = {}
+
+    values = extract_multiple_alliant(text, "High Energy Charge")
+    data["High_Energy_Charge_1"] = values[0] if len(values) > 0 else ""
+    data["High_Energy_Charge_2"] = values[1] if len(values) > 1 else ""
+
+    values = extract_multiple_alliant(text, "Regular Energy Charge")
+    data["Regular_Energy_Charge_1"] = values[0] if len(values) > 0 else ""
+    data["Regular_Energy_Charge_2"] = values[1] if len(values) > 1 else ""
+
+    values = extract_multiple_alliant(text, "Low Energy Charge")
+    data["Low_Energy_Charge_1"] = values[0] if len(values) > 0 else ""
+    data["Low_Energy_Charge_2"] = values[1] if len(values) > 1 else ""
+
+    values = extract_multiple_alliant(text, "On Peak Demand")
+    data["On_Peak_Demand_Charge_1"] = values[0] if len(values) > 0 else ""
+    data["On_Peak_Demand_Charge_2"] = values[1] if len(values) > 1 else ""
+
+    values = extract_multiple_alliant(text, "Customer Demand Charge")
+    data["Customer_Demand_Charge_1"] = values[0] if len(values) > 0 else ""
+    data["Customer_Demand_Charge_2"] = values[1] if len(values) > 1 else ""
+
+    values = extract_multiple_alliant(text, "Customer Charge")
+    data["Customer_Charge_1"] = values[0] if len(values) > 0 else ""
+    data["Customer_Charge_2"] = values[1] if len(values) > 1 else ""
+
+    values = extract_multiple_alliant(text, "2021 Fuel Adjustment")
+    data["Fuel_Adjustment_2021_1"] = values[0] if len(values) > 0 else ""
+    data["Fuel_Adjustment_2021_2"] = values[1] if len(values) > 1 else ""
+
+    values = extract_multiple_alliant(text, "2022 Fuel Adjustment")
+    data["Fuel_Adjustment_2022_1"] = values[0] if len(values) > 0 else ""
+    data["Fuel_Adjustment_2022_2"] = values[1] if len(values) > 1 else ""
+
+    match = re.search(r'State-Wide Low-Income Assistance Fee.*?\$([\d,]+\.\d{2})', text, re.IGNORECASE | re.DOTALL)
+    data["State_Wide_Low_Income_Assistance_Fee"] = clean_money_alliant(match.group(1)) if match else ""
+
+    county_match = re.search(r'County Tax.*?([\d\.]+)%.*?\$([\d,]+\.\d{2})', text, re.IGNORECASE | re.DOTALL)
+    if county_match:
+        data["County_Tax_Percentage"] = county_match.group(1)
+        data["County_Tax"] = county_match.group(2).replace(",", "")
+    else:
+        data["County_Tax_Percentage"] = ""
+        data["County_Tax"] = ""
+
+    state_match = re.search(r'Wisconsin Sales Tax.*?([\d\.]+)%.*?\$([\d,]+\.\d{2})', text, re.IGNORECASE | re.DOTALL)
+    if state_match:
+        data["Wisconsin_Sales_Tax_Percentage"] = state_match.group(1)
+        data["Wisconsin_Sales_Tax"] = state_match.group(2).replace(",", "")
+    else:
+        data["Wisconsin_Sales_Tax_Percentage"] = ""
+        data["Wisconsin_Sales_Tax"] = ""
+
+    return data
+
+
+# =========================================================
+# WORKER DISPATCHER LOGIC
+# =========================================================
+
+def process_pdf_bytes_sync(pdf_bytes: bytes, filename: str, vendor: str) -> dict:
     # Cloud Mega Backup Sequence
     if m:
         try:
@@ -116,15 +264,33 @@ def process_pdf_bytes(pdf_bytes, filename):
         except Exception as mega_err:
             print(f"Mega backup error (non-fatal): {mega_err}")
 
-    # Extract textual components using pdfplumber
-    full_text = ""
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                full_text += page_text + "\n"
+    # Process based on selected vendor
+    if vendor == "alliant_energy":
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        full_text = ""
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            pix = page.get_pixmap(dpi=300)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            text = pytesseract.image_to_string(img)
+            full_text += text + "\n"
 
-    return parse_bill(full_text, filename)
+        row = {"FileName": filename}
+        row.update(extract_alliant_summary_fields(full_text))
+        row.update(extract_alliant_charge_fields(full_text))
+        return row
+
+    else:
+        # Default: We Energies text extraction using pdfplumber
+        full_text = ""
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    full_text += page_text + "\n"
+
+        return parse_we_energies_bill(full_text, filename)
+
 
 # =========================================================
 # WEB NETWORK ROUTES
@@ -133,7 +299,10 @@ def process_pdf_bytes(pdf_bytes, filename):
 # BATCH MULTI-FILE ROUTE (Combines multiple bills into ONE CSV)
 @app.post("/api/process-bills-batch")
 @app.post("/extract_bills_batch/")
-async def process_bills_batch(files: List[UploadFile] = File(...)):
+async def process_bills_batch(
+    vendor: str = Form("we_energies"),
+    files: List[UploadFile] = File(...)
+):
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded.")
 
@@ -142,10 +311,13 @@ async def process_bills_batch(files: List[UploadFile] = File(...)):
     try:
         for file in files:
             if not file.filename.lower().endswith('.pdf'):
-                continue # Skip non-PDF files safely
+                continue  # Skip non-PDF files safely
 
             pdf_bytes = await file.read()
-            parsed_data = process_pdf_bytes(pdf_bytes, file.filename)
+            # Offload heavy OCR/extraction parsing to non-blocking thread
+            parsed_data = await asyncio.to_thread(
+                process_pdf_bytes_sync, pdf_bytes, file.filename, vendor
+            )
             combined_results.append(parsed_data)
 
         if not combined_results:
@@ -161,7 +333,7 @@ async def process_bills_batch(files: List[UploadFile] = File(...)):
             iter([csv_buffer.getvalue()]), 
             media_type="text/csv"
         )
-        response.headers["Content-Disposition"] = "attachment; filename=consolidated_bills_report.csv"
+        response.headers["Content-Disposition"] = f"attachment; filename=consolidated_bills_{vendor}.csv"
         return response
 
     except Exception as e:
@@ -170,13 +342,18 @@ async def process_bills_batch(files: List[UploadFile] = File(...)):
 # SINGLE FILE ROUTE (Preserved for backwards compatibility)
 @app.post("/api/process-bill")
 @app.post("/extract_bill/")
-async def process_bill(file: UploadFile = File(...)):
+async def process_bill(
+    vendor: str = Form("we_energies"),
+    file: UploadFile = File(...)
+):
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Please upload a valid PDF invoice.")
 
     try:
         pdf_bytes = await file.read()
-        parsed_results = process_pdf_bytes(pdf_bytes, file.filename)
+        parsed_results = await asyncio.to_thread(
+            process_pdf_bytes_sync, pdf_bytes, file.filename, vendor
+        )
         
         df = pd.DataFrame([parsed_results])
         csv_buffer = io.StringIO()
@@ -187,7 +364,7 @@ async def process_bill(file: UploadFile = File(...)):
             iter([csv_buffer.getvalue()]), 
             media_type="text/csv"
         )
-        response.headers["Content-Disposition"] = f"attachment; filename=extracted_{clean_filename}.csv"
+        response.headers["Content-Disposition"] = f"attachment; filename=extracted_{clean_filename}_{vendor}.csv"
         return response
 
     except Exception as e:
