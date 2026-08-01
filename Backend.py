@@ -44,12 +44,26 @@ except Exception as e:
 
 
 # =========================================================
-# WE ENERGIES EXTRACTION RULES & HELPERS
+# SHARED HELPERS & UTILITIES
 # =========================================================
 def clean_number(value):
     if value is None:
         return None
-    return float(value.replace(",", "").strip())
+    return float(str(value).replace(",", "").replace("$", "").strip())
+
+def extract_last_dollar_value(line):
+    if not line:
+        return None
+    amounts = re.findall(r"-?\$[\d,]+\.\d{2}", line)
+    if amounts:
+        return clean_number(amounts[-1])
+    return None
+
+def extract_line(pattern, text):
+    match = re.search(pattern, text, re.IGNORECASE)
+    if match:
+        return match.group(0)
+    return None
 
 def extract_money_after_label(label, text):
     pattern = rf"{re.escape(label)}.*"
@@ -75,6 +89,10 @@ def extract_value(pattern, text):
         return match.group(1).strip()
     return None
 
+
+# =========================================================
+# WE ENERGIES ELECTRIC PARSER
+# =========================================================
 def parse_we_energies_bill(text, filename):
     data = {}
     data["FileName"] = filename
@@ -112,6 +130,68 @@ def parse_we_energies_bill(text, filename):
     else:
         data["WICountySalesTax"] = None
         data["WICountySalesTaxPercentage"] = None
+
+    return data
+
+
+# =========================================================
+# WE ENERGIES GAS PARSER
+# =========================================================
+def parse_we_energies_gas_bill(text, filename):
+    data = {}
+    data["FileName"] = filename
+
+    bill_date_match = re.search(r"Bill Date.*?\n(\d{2}/\d{2}/\d{4})", text, re.DOTALL)
+    data["BillDate"] = bill_date_match.group(1) if bill_date_match else None
+
+    account_match = re.search(r"ACCOUNT NUMBER:\s*([0-9\-]+)", text)
+    data["AccountNumber"] = account_match.group(1) if account_match else None
+
+    total_current_charges_match = re.search(r"Total Current Charges\s+\$([\d,]+\.\d{2})", text)
+    data["TotalCurrentCharges"] = clean_number(total_current_charges_match.group(1)) if total_current_charges_match else None
+
+    total_current_balance_match = re.search(r"Total Current Balance\s+\$([\d,]+\.\d{2})", text)
+    data["TotalCurrentBalance"] = clean_number(total_current_balance_match.group(1)) if total_current_balance_match else None
+
+    total_gas_use_match = re.search(r"Total Gas Use.*?(\d+)\s+CCF", text, re.DOTALL)
+    data["TotalGasUse"] = clean_number(total_gas_use_match.group(1)) if total_gas_use_match else None
+
+    btu_match = re.search(r"CCF x ([\d\.]+)\s+BTU", text)
+    data["BTU"] = float(btu_match.group(1)) if btu_match else None
+
+    therms_match = re.search(r"=\s*([\d,\.]+)\s+Therms", text)
+    data["Therms"] = clean_number(therms_match.group(1)) if therms_match else None
+
+    customer_charge_line = extract_line(r"\n\s*Customer Charge\s+.*", text)
+    data["CustomerCharge"] = extract_last_dollar_value(customer_charge_line) if customer_charge_line else None
+
+    distribution_line = extract_line(r"\n\s*Distribution\s+.*", text)
+    data["Distribution"] = extract_last_dollar_value(distribution_line) if distribution_line else None
+
+    base_gas_line = extract_line(r"\n\s*Base Gas\s+.*", text)
+    data["BaseGas"] = extract_last_dollar_value(base_gas_line) if base_gas_line else None
+
+    pga_lines = re.findall(r"\n\s*PGA\s+.*", text, re.IGNORECASE)
+    pga_values = []
+    for line in pga_lines:
+        val = extract_last_dollar_value(line)
+        if val is not None:
+            pga_values.append(val)
+
+    for i, val in enumerate(pga_values, start=1):
+        data[f"PGA{i}"] = val
+
+    for i in range(len(pga_values) + 1, 6):
+        data[f"PGA{i}"] = None
+
+    state_tax_line = extract_line(r"\n\s*WI State Tax\s+.*", text)
+    data["WIStateTax"] = extract_last_dollar_value(state_tax_line) if state_tax_line else None
+
+    county_tax_line = extract_line(r"\n\s*WI County Sales Tax Kenosha\s+.*", text)
+    data["WICountySalesTaxKenosha"] = extract_last_dollar_value(county_tax_line) if county_tax_line else None
+
+    subtotal_match = re.search(r"Subtotal:\s+\$([\d,]+\.\d{2})", text)
+    data["Subtotal"] = clean_number(subtotal_match.group(1)) if subtotal_match else None
 
     return data
 
@@ -250,7 +330,7 @@ def extract_alliant_charge_fields(text):
 # WORKER DISPATCHER LOGIC
 # =========================================================
 
-def process_pdf_bytes_sync(pdf_bytes: bytes, filename: str, vendor: str) -> dict:
+def process_pdf_bytes_sync(pdf_bytes: bytes, filename: str, vendor: str, utility_type: str = "electric") -> dict:
     # Cloud Mega Backup Sequence
     if m:
         try:
@@ -264,7 +344,7 @@ def process_pdf_bytes_sync(pdf_bytes: bytes, filename: str, vendor: str) -> dict
         except Exception as mega_err:
             print(f"Mega backup error (non-fatal): {mega_err}")
 
-    # Process based on selected vendor
+    # Process based on selected vendor and utility type
     if vendor == "alliant_energy":
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         full_text = ""
@@ -280,8 +360,18 @@ def process_pdf_bytes_sync(pdf_bytes: bytes, filename: str, vendor: str) -> dict
         row.update(extract_alliant_charge_fields(full_text))
         return row
 
+    elif vendor == "we_energies" and utility_type.lower() == "gas":
+        full_text = ""
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    full_text += page_text + "\n"
+
+        return parse_we_energies_gas_bill(full_text, filename)
+
     else:
-        # Default: We Energies text extraction using pdfplumber
+        # Default: We Energies Electric text extraction
         full_text = ""
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
@@ -301,6 +391,7 @@ def process_pdf_bytes_sync(pdf_bytes: bytes, filename: str, vendor: str) -> dict
 @app.post("/extract_bills_batch/")
 async def process_bills_batch(
     vendor: str = Form("we_energies"),
+    utility_type: str = Form("electric"),
     files: List[UploadFile] = File(...)
 ):
     if not files:
@@ -316,7 +407,7 @@ async def process_bills_batch(
             pdf_bytes = await file.read()
             # Offload heavy OCR/extraction parsing to non-blocking thread
             parsed_data = await asyncio.to_thread(
-                process_pdf_bytes_sync, pdf_bytes, file.filename, vendor
+                process_pdf_bytes_sync, pdf_bytes, file.filename, vendor, utility_type
             )
             combined_results.append(parsed_data)
 
@@ -333,7 +424,7 @@ async def process_bills_batch(
             iter([csv_buffer.getvalue()]), 
             media_type="text/csv"
         )
-        response.headers["Content-Disposition"] = f"attachment; filename=consolidated_bills_{vendor}.csv"
+        response.headers["Content-Disposition"] = f"attachment; filename=consolidated_bills_{vendor}_{utility_type}.csv"
         return response
 
     except Exception as e:
@@ -344,6 +435,7 @@ async def process_bills_batch(
 @app.post("/extract_bill/")
 async def process_bill(
     vendor: str = Form("we_energies"),
+    utility_type: str = Form("electric"),
     file: UploadFile = File(...)
 ):
     if not file.filename.lower().endswith('.pdf'):
@@ -352,7 +444,7 @@ async def process_bill(
     try:
         pdf_bytes = await file.read()
         parsed_results = await asyncio.to_thread(
-            process_pdf_bytes_sync, pdf_bytes, file.filename, vendor
+            process_pdf_bytes_sync, pdf_bytes, file.filename, vendor, utility_type
         )
         
         df = pd.DataFrame([parsed_results])
@@ -364,7 +456,7 @@ async def process_bill(
             iter([csv_buffer.getvalue()]), 
             media_type="text/csv"
         )
-        response.headers["Content-Disposition"] = f"attachment; filename=extracted_{clean_filename}_{vendor}.csv"
+        response.headers["Content-Disposition"] = f"attachment; filename=extracted_{clean_filename}_{vendor}_{utility_type}.csv"
         return response
 
     except Exception as e:
